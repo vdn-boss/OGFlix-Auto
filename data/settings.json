@@ -1,0 +1,12 @@
+{
+  "blog_name": "OGFlix TV",
+  "blog_url": "https://ogflixtv.blogspot.com/",
+  "music_categories": [
+    "Rap",
+    "Hip-Hop",
+    "R&B"
+  ],
+  "post_mode": "draft",
+  "cover_format": "2:3",
+  "videos_per_run": 10
+}
