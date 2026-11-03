@@ -72,6 +72,9 @@ def load_approved_channels():
 
     print(f"Reading {len(entries)} approved channel entries.")
 
+    print(f"Channel file path: {CHANNELS_FILE}")
+print(f"YouTube API key loaded: {bool(YOUTUBE_KEY)}")
+
     for entry in entries:
         value = str(entry).strip()
 
