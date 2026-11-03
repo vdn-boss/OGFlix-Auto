@@ -65,8 +65,25 @@ def load_settings():
 
 
 def load_approved_channels():
-    channels = read_json(CHANNELS_FILE, [])
-    return set(channels)
+    entries = read_json(CHANNELS_FILE, [])
+    resolved = set()
+
+    for entry in entries:
+        value = str(entry).strip()
+
+        if not value:
+            continue
+
+        # Accept existing YouTube channel IDs.
+        if value.startswith("UC") and "/" not in value:
+            resolved.add(value)
+            continue
+
+        # Accept @handles and YouTube channel URLs.
+        match = re.search(r"youtube\.com/@([^/?]+)", value)
+
+        if match:
+            handle = match.group(1)
 
 
 def load_posted():
