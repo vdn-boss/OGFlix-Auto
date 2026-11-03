@@ -1,91 +1,103 @@
+
 import os
 import re
 import io
+import json
 import html
 import base64
-import sqlite3
-import smtplib
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-from email.header import Header
 
 import requests
-from dotenv import load_dotenv
-from openai import OpenAI
 import cloudinary
 import cloudinary.uploader
+from openai import OpenAI
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+SETTINGS_FILE = DATA / "settings.json"
+CHANNELS_FILE = DATA / "approved_channels.json"
+POSTED_FILE = DATA / "posted_videos.json"
 
 YOUTUBE_KEY = os.getenv("YOUTUBE_API_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-BLOGGER_EMAIL = os.getenv("BLOGGER_EMAIL", "1063oglive.posts@blogger.com")
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
-APPROVED_CHANNELS = {
-    x.strip() for x in os.getenv("APPROVED_CHANNEL_IDS", "").split(",") if x.strip()
-}
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "48"))
-MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "10"))
-DB = os.getenv("DATABASE_FILE", "ogflix_posted_videos.db")
+CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 
-required = {
+BLOGGER_CLIENT_ID = os.getenv("BLOGGER_CLIENT_ID")
+BLOGGER_CLIENT_SECRET = os.getenv("BLOGGER_CLIENT_SECRET")
+BLOGGER_REFRESH_TOKEN = os.getenv("BLOGGER_REFRESH_TOKEN")
+BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID")
+
+IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
+
+for name, value in {
     "YOUTUBE_API_KEY": YOUTUBE_KEY,
     "OPENAI_API_KEY": OPENAI_KEY,
-    "CLOUDINARY_URL": os.getenv("CLOUDINARY_URL"),
-    "SMTP_USER": SMTP_USER,
-    "SMTP_APP_PASSWORD": SMTP_PASSWORD,
-}
-missing = [k for k, v in required.items() if not v]
-if missing:
-    raise RuntimeError("Missing .env values: " + ", ".join(missing))
-if not APPROVED_CHANNELS:
-    raise RuntimeError("Add official YouTube channel IDs to APPROVED_CHANNEL_IDS.")
+    "CLOUDINARY_URL": CLOUDINARY_URL,
+    "BLOGGER_CLIENT_ID": BLOGGER_CLIENT_ID,
+    "BLOGGER_CLIENT_SECRET": BLOGGER_CLIENT_SECRET,
+    "BLOGGER_REFRESH_TOKEN": BLOGGER_REFRESH_TOKEN,
+    "BLOGGER_BLOG_ID": BLOGGER_BLOG_ID,
+}.items():
+    if not value:
+        raise RuntimeError(f"Missing GitHub secret: {name}")
 
 client = OpenAI(api_key=OPENAI_KEY)
-cloudinary.config(cloudinary_url=os.getenv("CLOUDINARY_URL"))
+cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
 
-def initialize_database():
-    with sqlite3.connect(DB) as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS posted (
-                video_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                posted_at TEXT NOT NULL
-            )"""
+def read_json(path, default):
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def load_settings():
+    return read_json(SETTINGS_FILE, {
+        "blog_name": "OGFlix TV",
+        "blog_url": "https://ogflixtv.blogspot.com/",
+        "music_categories": ["Rap", "Hip-Hop", "R&B"],
+        "post_mode": "draft",
+        "videos_per_run": 10,
+        "lookback_hours": 48
+    })
+
+
+def load_approved_channels():
+    channels = read_json(CHANNELS_FILE, [])
+    return set(channels)
+
+
+def load_posted():
+    return set(read_json(POSTED_FILE, []))
+
+
+def save_posted(posted):
+    DATA.mkdir(parents=True, exist_ok=True)
+    with POSTED_FILE.open("w", encoding="utf-8") as file:
+        json.dump(sorted(posted), file, indent=2)
+
+
+def discover_videos(settings, approved, posted):
+    if not approved:
+        raise RuntimeError(
+            "No approved YouTube channels found in data/approved_channels.json"
         )
 
+    hours = int(settings.get("lookback_hours", 48))
+    maximum = int(settings.get("videos_per_run", 10))
 
-def already_posted(video_id):
-    with sqlite3.connect(DB) as conn:
-        return conn.execute(
-            "SELECT 1 FROM posted WHERE video_id = ?", (video_id,)
-        ).fetchone() is not None
-
-
-def mark_posted(video_id, title):
-    with sqlite3.connect(DB) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO posted VALUES (?, ?, ?)",
-            (video_id, title, datetime.now(timezone.utc).isoformat()),
-        )
-
-
-def discover_videos():
     published_after = (
-        datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+        datetime.now(timezone.utc) - timedelta(hours=hours)
     ).isoformat(timespec="seconds").replace("+00:00", "Z")
+
     queries = [
         "official rap music video",
         "official hip hop music video",
-        "official R&B music video",
+        "official R&B music video"
     ]
+
     found = {}
 
     for query in queries:
@@ -99,9 +111,9 @@ def discover_videos():
                 "publishedAfter": published_after,
                 "videoCategoryId": "10",
                 "maxResults": 50,
-                "key": YOUTUBE_KEY,
+                "key": YOUTUBE_KEY
             },
-            timeout=30,
+            timeout=30
         )
         response.raise_for_status()
 
@@ -110,17 +122,25 @@ def discover_videos():
             snippet = item.get("snippet", {})
             channel_id = snippet.get("channelId", "")
             title = snippet.get("title", "")
-            if not video_id or channel_id not in APPROVED_CHANNELS:
+
+            if not video_id or channel_id not in approved:
                 continue
-            if already_posted(video_id):
+
+            if video_id in posted:
                 continue
 
             lowered = title.lower()
-            if not any(x in lowered for x in ("official music video", "official video")):
+
+            if not any(term in lowered for term in (
+                "official music video",
+                "official video"
+            )):
                 continue
-            if any(x in lowered for x in (
-                "lyrics", "lyric video", "reaction", "live performance",
-                "audio only", "visualizer"
+
+            if any(term in lowered for term in (
+                "lyrics", "lyric video", "reaction",
+                "live performance", "audio only",
+                "visualizer", "fan made"
             )):
                 continue
 
@@ -129,74 +149,133 @@ def discover_videos():
                 "title": title,
                 "channel": snippet.get("channelTitle", ""),
                 "channel_id": channel_id,
-                "published": snippet.get("publishedAt", ""),
+                "published": snippet.get("publishedAt", "")
             }
 
-    videos = sorted(found.values(), key=lambda x: x["published"], reverse=True)
-    return videos[:MAX_PER_RUN]
+    videos = sorted(
+        found.values(),
+        key=lambda video: video["published"],
+        reverse=True
+    )
+
+    return videos[:maximum]
 
 
 def extract_metadata(video):
+    title = video["title"]
+
     clean = re.sub(
-        r"\\s*[\\(\\[]?.*?(official music video|official video).*?[\\)\\]]?",
+        r"\s*[\(\[]\s*official.*?[\)\]]",
         "",
-        video["title"],
-        flags=re.IGNORECASE,
+        title,
+        flags=re.IGNORECASE
+    )
+
+    clean = re.sub(
+        r"\s*(official music video|official video)\s*",
+        "",
+        clean,
+        flags=re.IGNORECASE
     ).strip(" -|()[]")
-    clean = re.sub(r"\\s+", " ", clean)
 
     if " - " in clean:
         artist, song = clean.split(" - ", 1)
     elif " – " in clean:
         artist, song = clean.split(" – ", 1)
     else:
-        artist, song = video["channel"], clean
+        artist = video["channel"]
+        song = clean
+
+    year = video["published"][:4] if video["published"] else ""
 
     return {
         "artist": artist.strip(),
         "song": song.strip(),
-        "year": video["published"][:4] if video["published"] else "",
+        "year": year
     }
 
 
 def generate_cover(artist, song):
     prompt = f"""
-Create original cinematic theatrical movie-poster artwork for a music video.
-Song title: {song}
-Artist credit: {artist}
-Create a visually striking, premium Hollywood-style poster in a vertical 2:3
-composition. Use dramatic cinematic lighting, rich color grading, atmospheric
-depth, detailed visual storytelling, and a strong central visual concept
-inspired by the song title and mood. Make it look professionally commissioned.
-Do not imitate existing album or movie artwork. Do not depict identifiable real
-artists or existing movie characters. Do not add logos, watermarks, or text.
+Create original cinematic theatrical movie-poster artwork
+for a music video.
+
+Song: {song}
+Artist: {artist}
+
+Create a premium Hollywood-style movie poster in a vertical
+2:3 composition. Use dramatic cinematic lighting, rich color
+grading, atmospheric depth, detailed visual storytelling,
+and a powerful central visual concept inspired by the song.
+
+Make it look professionally commissioned and visually
+astonishing. Do not imitate existing album or movie artwork.
+Do not depict identifiable real artists or existing movie
+characters. Do not add logos, watermarks, or text.
 """
+
     result = client.images.generate(
         model=IMAGE_MODEL,
         prompt=prompt,
         size="1024x1536",
         quality="high",
-        output_format="jpeg",
+        output_format="jpeg"
     )
+
     encoded = result.data[0].b64_json
+
     if not encoded:
-        raise RuntimeError("Image API returned no base64 image data.")
+        raise RuntimeError("Image generation returned no image data.")
+
     return base64.b64decode(encoded)
 
 
-def upload_cover(image_bytes, artist, song):
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", f"{artist}-{song}").strip("-").lower()[:120]
+def upload_cover(image_bytes, artist, song, video_id):
+    slug = re.sub(
+        r"[^a-zA-Z0-9]+",
+        "-",
+        f"{artist}-{song}"
+    ).strip("-").lower()[:90]
+
+    public_id = f"{slug}-{video_id}"
+
     uploaded = cloudinary.uploader.upload(
         io.BytesIO(image_bytes),
         folder="ogflix/music-video-covers",
-        public_id=slug or "ogflix-cover",
+        public_id=public_id,
         overwrite=False,
-        resource_type="image",
+        resource_type="image"
     )
+
     url = uploaded["secure_url"]
-    poster = url.replace("/upload/", "/upload/c_fill,w_600,h_900,q_auto,f_auto/")
-    backdrop = url.replace("/upload/", "/upload/c_fill,w_1600,h_900,q_auto,f_auto/")
+
+    poster = url.replace(
+        "/upload/",
+        "/upload/c_fill,w_600,h_900,q_auto,f_auto/"
+    )
+
+    backdrop = url.replace(
+        "/upload/",
+        "/upload/c_fill,w_1600,h_900,q_auto,f_auto/"
+    )
+
     return poster, backdrop
+
+
+def get_blogger_token():
+    response = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": BLOGGER_CLIENT_ID,
+            "client_secret": BLOGGER_CLIENT_SECRET,
+            "refresh_token": BLOGGER_REFRESH_TOKEN,
+            "grant_type": "refresh_token"
+        },
+        timeout=30
+    )
+
+    response.raise_for_status()
+    return response.json()["access_token"]
 
 
 def build_blogger_html(video, metadata, poster, backdrop):
@@ -204,7 +283,10 @@ def build_blogger_html(video, metadata, poster, backdrop):
     song = html.escape(metadata["song"], quote=True)
     year = html.escape(metadata["year"], quote=True)
     video_id = html.escape(video["video_id"], quote=True)
-    youtube_embed = f"https://www.youtube.com/embed/{video_id}"
+
+    youtube_embed = (
+        f"https://www.youtube.com/embed/{video_id}"
+    )
 
     return f'''<div id="post-body-raw">
 <div class="separator" style="clear: both; text-align: center;">
@@ -229,46 +311,115 @@ def build_blogger_html(video, metadata, poster, backdrop):
 </div>'''
 
 
-def send_to_blogger(video, metadata, poster, backdrop, image_bytes):
-    subject = f"{metadata['song']} - {metadata['artist']}"
-    body = build_blogger_html(video, metadata, poster, backdrop)
-    message = MIMEMultipart("mixed")
-    message["From"] = SMTP_USER
-    message["To"] = BLOGGER_EMAIL
-    message["Subject"] = str(Header(subject, "utf-8"))
-    message.attach(MIMEText(body, "html", "utf-8"))
+def publish_to_blogger(video, metadata, poster, backdrop, token, settings):
+    blog_id = BLOGGER_BLOG_ID
 
-    attachment = MIMEImage(image_bytes, _subtype="jpeg")
-    attachment.add_header(
-        "Content-Disposition", "attachment", filename="ogflix-movie-cover.jpg"
+    title = f"{metadata['song']} - {metadata['artist']}"
+    content = build_blogger_html(
+        video, metadata, poster, backdrop
     )
-    message.attach(attachment)
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, [BLOGGER_EMAIL], message.as_string())
+    post_mode = settings.get("post_mode", "draft").lower()
+    is_draft = post_mode != "publish"
+
+    url = (
+        f"https://www.googleapis.com/blogger/v3/"
+        f"blogs/{blog_id}/posts"
+    )
+
+    response = requests.post(
+        url,
+        params={"isDraft": str(is_draft).lower()},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "kind": "blogger#post",
+            "title": title,
+            "content": content
+        },
+        timeout=60
+    )
+
+    response.raise_for_status()
+    result = response.json()
+
+    print(
+        f"BLOGGER {'DRAFT' if is_draft else 'PUBLISHED'}: "
+        f"{result.get('url', result.get('id'))}"
+    )
+
+    return result
 
 
 def main():
-    initialize_database()
-    print("OGFlix TV music-video automation started.")
-    videos = discover_videos()
-    print(f"New videos from approved channels: {len(videos)}")
+    print("OGFlix TV automation started.")
+
+    settings = load_settings()
+    approved = load_approved_channels()
+    posted = load_posted()
+
+    print(f"Approved channels: {len(approved)}")
+
+    videos = discover_videos(settings, approved, posted)
+
+    print(f"New eligible videos found: {len(videos)}")
+
+    if not videos:
+        print("No new eligible videos. Finished.")
+        return
+
+    token = get_blogger_token()
 
     for video in videos:
         try:
             metadata = extract_metadata(video)
-            print(f"Processing: {metadata['artist']} - {metadata['song']}")
-            image_bytes = generate_cover(metadata["artist"], metadata["song"])
-            poster, backdrop = upload_cover(image_bytes, metadata["artist"], metadata["song"])
-            send_to_blogger(video, metadata, poster, backdrop, image_bytes)
-            mark_posted(video["video_id"], video["title"])
+
+            if not metadata["artist"] or not metadata["song"]:
+                print("Skipping video with incomplete metadata.")
+                continue
+
+            print(
+                f"Processing: {metadata['artist']} - "
+                f"{metadata['song']}"
+            )
+
+            image_bytes = generate_cover(
+                metadata["artist"],
+                metadata["song"]
+            )
+
+            poster, backdrop = upload_cover(
+                image_bytes,
+                metadata["artist"],
+                metadata["song"],
+                video["video_id"]
+            )
+
+            publish_to_blogger(
+                video,
+                metadata,
+                poster,
+                backdrop,
+                token,
+                settings
+            )
+
+            posted.add(video["video_id"])
+            save_posted(posted)
+
             print(
                 f"SUCCESS: {metadata['song']} | "
-                f"https://www.youtube.com/watch?v={video['video_id']}"
+                f"https://www.youtube.com/watch?v="
+                f"{video['video_id']}"
             )
+
         except Exception as exc:
-            print(f"ERROR for {video.get('title', 'unknown video')}: {exc}")
+            print(
+                f"ERROR processing {video.get('title', 'unknown')}: "
+                f"{exc}"
+            )
 
     print("OGFlix TV automation finished.")
 
