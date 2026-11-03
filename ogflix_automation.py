@@ -64,9 +64,51 @@ def load_settings():
     })
 
 
+
 def load_approved_channels():
     entries = read_json(CHANNELS_FILE, [])
     resolved = set()
+
+    for entry in entries:
+        value = str(entry).strip()
+
+        if not value:
+            continue
+
+        if value.startswith("UC") and "/" not in value:
+            resolved.add(value)
+            continue
+
+        match = re.search(r"youtube\.com/@([^/?]+)", value)
+        handle = match.group(1) if match else value.lstrip("@")
+
+        try:
+            response = requests.get(
+                "https://www.googleapis.com/youtube/v3/channels",
+                params={
+                    "part": "id",
+                    "forHandle": handle,
+                    "key": YOUTUBE_KEY
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+
+            items = response.json().get("items", [])
+
+            if items:
+                channel_id = items[0]["id"]
+                resolved.add(channel_id)
+                print(f"APPROVED: @{handle} -> {channel_id}")
+            else:
+                print(f"WARNING: Channel not found: @{handle}")
+
+        except requests.RequestException as exc:
+            print(f"ERROR resolving @{handle}: {exc}")
+
+    print(f"Successfully resolved {len(resolved)} approved channels.")
+    return resolved
+
 
     for entry in entries:
         value = str(entry).strip()
