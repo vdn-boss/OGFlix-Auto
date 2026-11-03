@@ -54,15 +54,20 @@ def read_json(path, default):
 
 
 def load_settings():
-    return read_json(SETTINGS_FILE, {
+    defaults = {
         "blog_name": "OGFlix TV",
         "blog_url": "https://ogflixtv.blogspot.com/",
         "music_categories": ["Rap", "Hip-Hop", "R&B"],
         "post_mode": "draft",
         "videos_per_run": 10,
-        "lookback_hours": 48
-    })
-
+        "lookback_hours": 48,
+        "auto_discovery": True,
+    }
+    saved = read_json(SETTINGS_FILE, {})
+    if not isinstance(saved, dict):
+        raise RuntimeError("data/settings.json must contain a JSON object.")
+    defaults.update(saved)
+    return defaults
 
 
 
@@ -92,7 +97,7 @@ def load_approved_channels():
             continue
 
         # Accept @handles or full YouTube channel URLs.
-        match = re.search(r"youtube\\.com/@([^/?]+)", value)
+        match = re.search(r"youtube\.com/@([^/?]+)", value)
         handle = match.group(1) if match else value.lstrip("@")
 
         try:
@@ -133,84 +138,127 @@ def save_posted(posted):
 
 
 def discover_videos(settings, approved, posted):
-    if not approved:
-        raise RuntimeError(
-            "No approved YouTube channels found in data/approved_channels.json"
-        )
+    """
+    Find videos from two sources:
+    1. Every manually approved channel, searched directly.
+    2. Broader Rap / Hip-Hop / R&B searches for likely official releases.
 
+    YouTube does not expose a reliable Official Artist Channel verification
+    flag through search.list, so broad discovery uses conservative title and
+    channel-name checks. Review the first live posts before relying on it.
+    """
     hours = int(settings.get("lookback_hours", 48))
     maximum = int(settings.get("videos_per_run", 10))
+    auto_discovery = settings.get("auto_discovery", True)
+    print(f"Automatic discovery enabled: {bool(auto_discovery)}")
 
     published_after = (
         datetime.now(timezone.utc) - timedelta(hours=hours)
     ).isoformat(timespec="seconds").replace("+00:00", "Z")
 
-    queries = [
-        "official rap music video",
-        "official hip hop music video",
-        "official R&B music video"
-    ]
-
     found = {}
 
-    for query in queries:
+    excluded_terms = (
+        "lyrics", "lyric video", "reaction", "live performance",
+        "audio only", "visualizer", "fan made", "cover", "dance practice",
+        "behind the scenes", "interview", "shorts"
+    )
+    official_title_terms = (
+        "official music video", "official video", "official mv"
+    )
+    trusted_channel_terms = (
+        "vevo", "official", "records", "recordings", "music",
+        "entertainment", "label", "universal", "atlantic", "warner",
+        "sony", "def jam", "motown", "roc nation", "cash money",
+        "young money", "interscope", "empire", "quality control"
+    )
+
+    def search_videos(params, source_label):
+        request_params = {
+            "part": "snippet",
+            "type": "video",
+            "order": "date",
+            "publishedAfter": published_after,
+            "videoCategoryId": "10",
+            "maxResults": 50,
+            "key": YOUTUBE_KEY,
+        }
+        request_params.update(params)
+
         response = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
-            params={
-                "part": "snippet",
-                "q": query,
-                "type": "video",
-                "order": "date",
-                "publishedAfter": published_after,
-                "videoCategoryId": "10",
-                "maxResults": 50,
-                "key": YOUTUBE_KEY
-            },
-            timeout=30
+            params=request_params,
+            timeout=30,
         )
         response.raise_for_status()
 
-        for item in response.json().get("items", []):
+        items = response.json().get("items", [])
+        print(f"{source_label}: YouTube returned {len(items)} results.")
+
+        for item in items:
             video_id = item.get("id", {}).get("videoId")
             snippet = item.get("snippet", {})
             channel_id = snippet.get("channelId", "")
             title = snippet.get("title", "")
+            channel_name = snippet.get("channelTitle", "")
+            lowered_title = title.lower()
+            lowered_channel = channel_name.lower()
 
-            if not video_id or channel_id not in approved:
+            if not video_id or video_id in posted:
                 continue
 
-            if video_id in posted:
+            if any(term in lowered_title for term in excluded_terms):
                 continue
 
-            lowered = title.lower()
-
-            if not any(term in lowered for term in (
-                "official music video",
-                "official video"
-            )):
+            has_official_title = any(
+                term in lowered_title for term in official_title_terms
+            )
+            if not has_official_title:
                 continue
 
-            if any(term in lowered for term in (
-                "lyrics", "lyric video", "reaction",
-                "live performance", "audio only",
-                "visualizer", "fan made"
-            )):
-                continue
+            # Direct searches are trusted because the channel was manually
+            # approved. Broad searches require a recognizable official,
+            # VEVO, label, or music-company channel name.
+            if source_label == "AUTOMATIC DISCOVERY":
+                if not any(term in lowered_channel for term in trusted_channel_terms):
+                    continue
 
             found[video_id] = {
                 "video_id": video_id,
                 "title": title,
-                "channel": snippet.get("channelTitle", ""),
+                "channel": channel_name,
                 "channel_id": channel_id,
-                "published": snippet.get("publishedAt", "")
+                "published": snippet.get("publishedAt", ""),
+                "discovery_source": source_label,
             }
+
+    # Search each approved channel directly. This avoids losing its uploads
+    # just because a global YouTube search did not rank them in its first 50.
+    print(f"Searching {len(approved)} approved channels directly.")
+    for channel_id in sorted(approved):
+        search_videos(
+            {"channelId": channel_id},
+            f"APPROVED CHANNEL {channel_id}",
+        )
+
+    # Add wider discovery without requiring the channel to be in the manual
+    # approval list. Broad results are filtered more strictly above.
+    if auto_discovery:
+        broad_queries = (
+            "official rap music video",
+            "official hip hop music video",
+            "official R&B music video",
+        )
+        for query in broad_queries:
+            search_videos({"q": query}, "AUTOMATIC DISCOVERY")
 
     videos = sorted(
         found.values(),
         key=lambda video: video["published"],
-        reverse=True
+        reverse=True,
     )
 
+    print(f"Unique eligible videos after filtering: {len(videos)}")
     return videos[:maximum]
 
 
