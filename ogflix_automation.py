@@ -375,6 +375,7 @@ def get_blogger_token():
         timeout=30
     )
 
+    print("BLOGGER TOKEN ERROR:", response.text)
     response.raise_for_status()
     return response.json()["access_token"]
 
