@@ -185,8 +185,32 @@ def discover_videos(settings, approved, posted):
             params=request_params,
             timeout=30,
         )
+        
+        response = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params=request_params,
+            timeout=30,
+        )
+
         if not response.ok:
-        print("YOUTUBE API ERROR:")
+            print("YOUTUBE API ERROR:")
+            print("HTTP Status:", response.status_code)
+
+            try:
+                error_data = response.json()
+                print("API Error Details:", json.dumps(error_data, indent=2))
+            except Exception:
+                print("API Response:", response.text)
+
+            response.raise_for_status()
+
+        items = response.json().get("items", [])
+        print(f"{source_label}: YouTube returned {len(items)} results.")
+
+        for item in items:
+            video_id = item.get("id", {}).get("videoId")
+            snippet = item.get("snippet", {})
+
         print("HTTP Status:", response.status_code)
 
         try:
