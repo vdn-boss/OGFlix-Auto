@@ -186,15 +186,16 @@ def discover_videos(settings, approved, posted):
             timeout=30,
         )
         if not response.ok:
-    print("YOUTUBE API ERROR:")
-    print("HTTP Status:", response.status_code)
-    try:
-        error_data = response.json()
-        print("API Error Details:", json.dumps(error_data, indent=2))
-    except Exception:
-        print("API Response:", response.text)
+        print("YOUTUBE API ERROR:")
+        print("HTTP Status:", response.status_code)
 
-    response.raise_for_status()
+        try:
+            error_data = response.json()
+            print("API Error Details:", json.dumps(error_data, indent=2))
+        except Exception:
+            print("API Response:", response.text)
+
+        response.raise_for_status()
 
         items = response.json().get("items", [])
         print(f"{source_label}: YouTube returned {len(items)} results.")
