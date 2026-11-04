@@ -8,5 +8,6 @@
   ],
   "post_mode": "publish",
   "cover_format": "2:3",
-  "videos_per_run": 10
-} 
+  "videos_per_run": 10,
+  "lookback_hours": 168
+}
