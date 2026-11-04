@@ -132,168 +132,157 @@ def save_posted(posted):
         json.dump(sorted(posted), file, indent=2)
 
 
+def youtube_get(endpoint, params, timeout=30):
+    """Make a YouTube Data API request and print useful quota/error details."""
+    request_params = dict(params)
+    request_params["key"] = YOUTUBE_KEY
+    response = requests.get(
+        f"https://www.googleapis.com/youtube/v3/{endpoint}",
+        params=request_params,
+        timeout=timeout,
+    )
+    if not response.ok:
+        print(f"YOUTUBE API ERROR ({endpoint}): HTTP {response.status_code}")
+        try:
+            print(json.dumps(response.json(), indent=2))
+        except Exception:
+            print(response.text)
+        response.raise_for_status()
+    return response.json()
+
+
 def discover_videos(settings, approved, posted):
     """
-    Find videos from two sources:
-    1. Every manually approved channel, searched directly.
-    2. Broader Rap / Hip-Hop / R&B searches for likely official releases.
-
-    YouTube does not expose a reliable Official Artist Channel verification
-    flag through search.list, so broad discovery uses conservative title and
-    channel-name checks. Review the first live posts before relying on it.
+    Discover recent uploads from approved channels without search.list.
+    This uses channels.list, playlistItems.list, and videos.list, which
+    consume far fewer quota units than search.list.
     """
     hours = int(settings.get("lookback_hours", 48))
     maximum = int(settings.get("videos_per_run", 10))
-    auto_discovery = settings.get("auto_discovery", True)
-    print(f"Automatic discovery enabled: {bool(auto_discovery)}")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    published_after = (
-        datetime.now(timezone.utc) - timedelta(hours=hours)
-    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+    if not approved:
+        print("No approved channels are available to scan.")
+        return []
+
+    print(
+        "Automatic keyword discovery via search.list is paused because "
+        "the YouTube Search Queries daily quota was exhausted. "
+        "Scanning approved-channel upload playlists instead."
+    )
+
+    channel_data = youtube_get(
+        "channels",
+        {
+            "part": "snippet,contentDetails",
+            "id": ",".join(sorted(approved)),
+            "maxResults": 50,
+        },
+    )
 
     found = {}
-
-    excluded_terms = (
-        "lyrics", "lyric video", "reaction", "live performance",
-        "audio only", "visualizer", "fan made", "cover", "dance practice",
-        "behind the scenes", "interview", "shorts"
-    )
-    official_title_terms = (
-        "official music video", "official video", "official mv"
-    )
-    trusted_channel_terms = (
-        "vevo", "official", "records", "recordings", "music",
-        "entertainment", "label", "universal", "atlantic", "warner",
-        "sony", "def jam", "motown", "roc nation", "cash money",
-        "young money", "interscope", "empire", "quality control"
-    )
-
-    def search_videos(params, source_label):
-        request_params = {
-            "part": "snippet",
-            "type": "video",
-            "order": "date",
-            "publishedAfter": published_after,
-            "videoCategoryId": "10",
-            "maxResults": 50,
-            "key": YOUTUBE_KEY,
-        }
-        request_params.update(params)
-
-        response = requests.get(
-            "https://www.googleapis.com/youtube/v3/search",
-            params=request_params,
-            timeout=30,
+    for channel in channel_data.get("items", []):
+        channel_id = channel.get("id", "")
+        channel_title = channel.get("snippet", {}).get("title", "")
+        uploads_playlist = (
+            channel.get("contentDetails", {})
+            .get("relatedPlaylists", {})
+            .get("uploads")
         )
-        
-        response = requests.get(
-            "https://www.googleapis.com/youtube/v3/search",
-            params=request_params,
-            timeout=30,
+        if not uploads_playlist:
+            print(f"No uploads playlist found for channel {channel_id}.")
+            continue
+
+        playlist_data = youtube_get(
+            "playlistItems",
+            {
+                "part": "snippet,contentDetails",
+                "playlistId": uploads_playlist,
+                "maxResults": 50,
+            },
         )
 
-        if not response.ok:
-            print("YOUTUBE API ERROR:")
-            print("HTTP Status:", response.status_code)
-
-            try:
-                error_data = response.json()
-                print("API Error Details:", json.dumps(error_data, indent=2))
-            except Exception:
-                print("API Response:", response.text)
-
-            response.raise_for_status()
-
-        items = response.json().get("items", [])
-        print(f"{source_label}: YouTube returned {len(items)} results.")
-
-        for item in items:
-            video_id = item.get("id", {}).get("videoId")
+        for item in playlist_data.get("items", []):
             snippet = item.get("snippet", {})
-
-        print("HTTP Status:", response.status_code)
-
-        try:
-            error_data = response.json()
-            print("API Error Details:", json.dumps(error_data, indent=2))
-        except Exception:
-            print("API Response:", response.text)
-
-        response.raise_for_status()
-
-        items = response.json().get("items", [])
-        print(f"{source_label}: YouTube returned {len(items)} results.")
-
-        for item in items:
-            video_id = item.get("id", {}).get("videoId")
-            snippet = item.get("snippet", {})
-            channel_id = snippet.get("channelId", "")
-            title = snippet.get("title", "")
-            channel_name = snippet.get("channelTitle", "")
-            lowered_title = title.lower()
-            lowered_channel = channel_name.lower()
-
+            video_id = item.get("contentDetails", {}).get("videoId")
+            published = (
+                item.get("contentDetails", {}).get("videoPublishedAt")
+                or snippet.get("publishedAt", "")
+            )
             if not video_id or video_id in posted:
                 continue
 
-            if any(term in lowered_title for term in excluded_terms):
+            try:
+                published_dt = datetime.fromisoformat(
+                    published.replace("Z", "+00:00")
+                )
+            except (ValueError, AttributeError):
                 continue
 
-            has_official_title = any(
-                term in lowered_title for term in official_title_terms
+            if published_dt < cutoff:
+                continue
+
+            title = snippet.get("title", "")
+            lowered = title.lower()
+            if any(term in lowered for term in (
+                "lyrics", "lyric video", "reaction", "live performance",
+                "audio only", "visualizer", "fan made", "cover",
+                "dance practice", "behind the scenes", "interview", "shorts"
+            )):
+                continue
+
+            if not any(term in lowered for term in (
+                "official music video", "official video", "official mv"
+            )):
+                continue
+
+            thumbnails = snippet.get("thumbnails", {})
+            thumbnail_url = (
+                thumbnails.get("maxres", {}).get("url")
+                or thumbnails.get("high", {}).get("url")
+                or thumbnails.get("medium", {}).get("url")
+                or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
             )
-            if not has_official_title:
-                continue
-
-            # Direct searches are trusted because the channel was manually
-            # approved. Broad searches require a recognizable official,
-            # VEVO, label, or music-company channel name.
-            if source_label == "AUTOMATIC DISCOVERY":
-                if not any(term in lowered_channel for term in trusted_channel_terms):
-                    continue
 
             found[video_id] = {
                 "video_id": video_id,
                 "title": title,
-                "channel": channel_name,
+                "channel": channel_title or snippet.get("channelTitle", ""),
                 "channel_id": channel_id,
-                "published": snippet.get("publishedAt", ""),
-                "thumbnail_url": (
-                    snippet.get("thumbnails", {}).get("maxres", {}).get("url")
-                    or snippet.get("thumbnails", {}).get("high", {}).get("url")
-                    or snippet.get("thumbnails", {}).get("medium", {}).get("url")
-                    or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
-                ),
-                "discovery_source": source_label,
+                "published": published,
+                "thumbnail_url": thumbnail_url,
+                "discovery_source": f"APPROVED CHANNEL {channel_id}",
             }
 
-    # Search each approved channel directly. This avoids losing its uploads
-    # just because a global YouTube search did not rank them in its first 50.
-    print(f"Searching {len(approved)} approved channels directly.")
-    for channel_id in sorted(approved):
-        search_videos(
-            {"channelId": channel_id},
-            f"APPROVED CHANNEL {channel_id}",
+    # Confirm that videos permit embedding. A single videos.list call can
+    # check up to 50 video IDs.
+    candidates = list(found.values())
+    embeddable_ids = set()
+    for offset in range(0, len(candidates), 50):
+        batch_ids = [
+            item["video_id"] for item in candidates[offset:offset + 50]
+        ]
+        if not batch_ids:
+            continue
+        status_data = youtube_get(
+            "videos",
+            {
+                "part": "status",
+                "id": ",".join(batch_ids),
+                "maxResults": 50,
+            },
         )
+        for item in status_data.get("items", []):
+            if item.get("status", {}).get("embeddable") is True:
+                embeddable_ids.add(item["id"])
 
-    # Add wider discovery without requiring the channel to be in the manual
-    # approval list. Broad results are filtered more strictly above.
-    if auto_discovery:
-        broad_queries = (
-            "official rap music video",
-            "official hip hop music video",
-            "official R&B music video",
-        )
-        for query in broad_queries:
-            search_videos({"q": query}, "AUTOMATIC DISCOVERY")
+    videos = [
+        item for item in candidates if item["video_id"] in embeddable_ids
+    ]
+    videos.sort(key=lambda item: item["published"], reverse=True)
 
-    videos = sorted(
-        found.values(),
-        key=lambda video: video["published"],
-        reverse=True,
-    )
-
-    print(f"Unique eligible videos after filtering: {len(videos)}")
+    print(f"Recent approved-channel videos found: {len(candidates)}")
+    print(f"Videos allowing embedding: {len(videos)}")
     return videos[:maximum]
 
 
@@ -545,6 +534,38 @@ def build_blogger_html(video, metadata, poster, backdrop):
 </div>'''
 
 
+
+def build_blogger_labels(video, metadata, settings):
+    """Return Blogger labels appropriate to the detected post type."""
+    title = str(video.get("title", "")).lower()
+    content_type = str(metadata.get("content_type", "")).lower()
+
+    labels = []
+    if "short film" in title or content_type in ("short film", "shortfilm"):
+        labels.extend(["ShortFilms", "Films"])
+    elif any(term in title for term in (
+        "full movie", "feature film", "full film"
+    )) or content_type in ("movie", "full movie", "film"):
+        labels.extend(["Movies", "Films"])
+    elif "mixtape" in title or content_type == "mixtape":
+        labels.extend(["Mixtapes", "Albums"])
+    elif "single" in title or content_type == "single":
+        labels.extend(["Singles", "Songs"])
+    else:
+        # The current discovery pipeline specifically selects official
+        # music videos, so these are the default labels for its posts.
+        labels.extend(["MusicVideos", "Songs"])
+
+    # Add configured music genres/categories without duplicates.
+    for category in settings.get("music_categories", []):
+        value = str(category).strip()
+        if value:
+            labels.append(value)
+
+    # Preserve order while removing duplicate labels.
+    return list(dict.fromkeys(labels))
+
+
 def publish_to_blogger(video, metadata, poster, backdrop, token, settings):
     blog_id = BLOGGER_BLOG_ID
 
@@ -571,7 +592,8 @@ def publish_to_blogger(video, metadata, poster, backdrop, token, settings):
         json={
             "kind": "blogger#post",
             "title": title,
-            "content": content
+            "content": content,
+            "labels": build_blogger_labels(video, metadata, settings)
         },
         timeout=60
     )
