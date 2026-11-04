@@ -4,14 +4,13 @@ import re
 import io
 import json
 import html
-import base64
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import requests
 import cloudinary
 import cloudinary.uploader
-from openai import OpenAI
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -20,7 +19,6 @@ CHANNELS_FILE = DATA / "approved_channels.json"
 POSTED_FILE = DATA / "posted_videos.json"
 
 YOUTUBE_KEY = os.getenv("YOUTUBE_API_KEY")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 
 BLOGGER_CLIENT_ID = os.getenv("BLOGGER_CLIENT_ID")
@@ -28,11 +26,9 @@ BLOGGER_CLIENT_SECRET = os.getenv("BLOGGER_CLIENT_SECRET")
 BLOGGER_REFRESH_TOKEN = os.getenv("BLOGGER_REFRESH_TOKEN")
 BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID")
 
-IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-flare")
 
 for name, value in {
     "YOUTUBE_API_KEY": YOUTUBE_KEY,
-    "OPENAI_API_KEY": OPENAI_KEY,
     "CLOUDINARY_URL": CLOUDINARY_URL,
     "BLOGGER_CLIENT_ID": BLOGGER_CLIENT_ID,
     "BLOGGER_CLIENT_SECRET": BLOGGER_CLIENT_SECRET,
@@ -42,7 +38,6 @@ for name, value in {
     if not value:
         raise RuntimeError(f"Missing GitHub secret: {name}")
 
-client = OpenAI(api_key=OPENAI_KEY)
 cloudinary.config(cloudinary_url=CLOUDINARY_URL)
 
 
@@ -229,6 +224,12 @@ def discover_videos(settings, approved, posted):
                 "channel": channel_name,
                 "channel_id": channel_id,
                 "published": snippet.get("publishedAt", ""),
+                "thumbnail_url": (
+                    snippet.get("thumbnails", {}).get("maxres", {}).get("url")
+                    or snippet.get("thumbnails", {}).get("high", {}).get("url")
+                    or snippet.get("thumbnails", {}).get("medium", {}).get("url")
+                    or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+                ),
                 "discovery_source": source_label,
             }
 
@@ -296,39 +297,135 @@ def extract_metadata(video):
     }
 
 
-def generate_cover(artist, song):
-    prompt = f"""
-Create original cinematic theatrical movie-poster artwork
-for a music video.
+def load_poster_font(size, bold=True):
+    """Load a common Linux font, with a Pillow fallback."""
+    candidates = []
+    if bold:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        ])
+    else:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ])
 
-Song: {song}
-Artist: {artist}
+    for font_path in candidates:
+        if Path(font_path).exists():
+            return ImageFont.truetype(font_path, size=size)
+    return ImageFont.load_default()
 
-Create a premium Hollywood-style movie poster in a vertical
-2:3 composition. Use dramatic cinematic lighting, rich color
-grading, atmospheric depth, detailed visual storytelling,
-and a powerful central visual concept inspired by the song.
 
-Make it look professionally commissioned and visually
-astonishing. Do not imitate existing album or movie artwork.
-Do not depict identifiable real artists or existing movie
-characters. Do not add logos, watermarks, or text.
-"""
+def wrap_poster_text(draw, text, font, max_width):
+    words = str(text).split()
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and draw.textbbox((0, 0), candidate, font=font)[2] > max_width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines or [""]
 
-    result = client.images.generate(
-        model=IMAGE_MODEL,
-        prompt=prompt,
-        size="1024x1536",
-        quality="high",
-        output_format="jpeg"
+
+def generate_cover(video, artist, song):
+    """Create a 2:3 movie-poster graphic from the video's YouTube thumbnail.
+
+    This is a local Pillow design; it does not call a paid image-generation API.
+    """
+    width, height = 1200, 1800
+    thumbnail_url = video.get("thumbnail_url") or (
+        f"https://i.ytimg.com/vi/{video['video_id']}/hqdefault.jpg"
     )
 
-    encoded = result.data[0].b64_json
+    response = requests.get(thumbnail_url, timeout=45)
+    if not response.ok:
+        # Some uploads do not provide a max-resolution thumbnail.
+        fallback_url = f"https://i.ytimg.com/vi/{video['video_id']}/hqdefault.jpg"
+        response = requests.get(fallback_url, timeout=45)
+    response.raise_for_status()
 
-    if not encoded:
-        raise RuntimeError("Image generation returned no image data.")
+    from io import BytesIO
+    original = Image.open(BytesIO(response.content)).convert("RGB")
 
-    return base64.b64decode(encoded)
+    # Full-bleed, softened image gives the poster a cinematic background.
+    background = ImageOps.fit(original, (width, height), method=Image.Resampling.LANCZOS)
+    background = background.filter(ImageFilter.GaussianBlur(radius=24))
+    background = ImageEnhance.Brightness(background).enhance(0.42)
+    poster = background.convert("RGBA")
+
+    # Dark gradients create readable text while keeping the source image visible.
+    top_gradient = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    top_draw = ImageDraw.Draw(top_gradient)
+    for y in range(height):
+        alpha = int(175 * max(0, 1 - y / 680))
+        if alpha:
+            top_draw.line((0, y, width, y), fill=(5, 8, 15, alpha))
+    poster = Image.alpha_composite(poster, top_gradient)
+
+    bottom_gradient = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    bottom_draw = ImageDraw.Draw(bottom_gradient)
+    start_y = 900
+    for y in range(start_y, height):
+        progress = (y - start_y) / max(1, height - start_y)
+        alpha = int(70 + 175 * progress)
+        bottom_draw.line((0, y, width, y), fill=(3, 5, 10, alpha))
+    poster = Image.alpha_composite(poster, bottom_gradient)
+
+    # Main thumbnail panel, preserving the familiar video frame.
+    frame = ImageOps.fit(original, (1080, 608), method=Image.Resampling.LANCZOS)
+    frame = ImageEnhance.Contrast(frame).enhance(1.08)
+    frame = ImageEnhance.Color(frame).enhance(1.12)
+    frame_x, frame_y = 60, 350
+    poster.alpha_composite(frame.convert("RGBA"), (frame_x, frame_y))
+
+    draw = ImageDraw.Draw(poster)
+    white = (255, 255, 255, 255)
+    accent = (244, 190, 65, 255)
+
+    small_font = load_poster_font(34, bold=True)
+    eyebrow_font = load_poster_font(30, bold=True)
+    title_font_size = 112
+    title_font = load_poster_font(title_font_size, bold=True)
+    artist_font = load_poster_font(58, bold=True)
+    footer_font = load_poster_font(28, bold=True)
+
+    # Top brand line.
+    draw.text((64, 78), "OGFLIX TV", font=load_poster_font(54, bold=True), fill=white)
+    draw.text((66, 150), "MUSIC VIDEO PREMIERE", font=eyebrow_font, fill=accent)
+    draw.line((64, 215, 1136, 215), fill=(255, 255, 255, 150), width=3)
+
+    # Poster title and artist.
+    title_lines = wrap_poster_text(draw, song.upper(), title_font, 1060)
+    if len(title_lines) > 2:
+        title_font_size = 88
+        title_font = load_poster_font(title_font_size, bold=True)
+        title_lines = wrap_poster_text(draw, song.upper(), title_font, 1060)
+    y = 1110
+    for line in title_lines[:4]:
+        draw.text((64, y), line, font=title_font, fill=white, stroke_width=2, stroke_fill=(0, 0, 0, 170))
+        y += int(title_font_size * 1.05)
+
+    artist_y = min(y + 24, 1580)
+    artist_text = artist.upper()
+    artist_lines = wrap_poster_text(draw, artist_text, artist_font, 1060)
+    for line in artist_lines[:2]:
+        draw.text((68, artist_y), line, font=artist_font, fill=accent)
+        artist_y += 72
+
+    year = video.get("published", "")[:4]
+    footer = f"OFFICIAL MUSIC VIDEO  •  {year}" if year else "OFFICIAL MUSIC VIDEO"
+    draw.line((64, 1690, 1136, 1690), fill=(255, 255, 255, 130), width=2)
+    draw.text((66, 1720), footer, font=footer_font, fill=white)
+
+    output = BytesIO()
+    poster.convert("RGB").save(output, format="JPEG", quality=92, optimize=True)
+    return output.getvalue()
 
 
 def upload_cover(image_bytes, artist, song, video_id):
@@ -375,8 +472,9 @@ def get_blogger_token():
         timeout=30
     )
 
-    print("BLOGGER TOKEN ERROR:", response.text)
-    response.raise_for_status()
+    if not response.ok:
+        print("BLOGGER TOKEN ERROR:", response.text)
+        response.raise_for_status()
     return response.json()["access_token"]
 
 
@@ -488,6 +586,7 @@ def main():
             )
 
             image_bytes = generate_cover(
+                video,
                 metadata["artist"],
                 metadata["song"]
             )
