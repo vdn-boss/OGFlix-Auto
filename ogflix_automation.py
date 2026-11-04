@@ -6,6 +6,7 @@ import json
 import html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests
 import cloudinary
@@ -25,6 +26,9 @@ BLOGGER_CLIENT_ID = os.getenv("BLOGGER_CLIENT_ID")
 BLOGGER_CLIENT_SECRET = os.getenv("BLOGGER_CLIENT_SECRET")
 BLOGGER_REFRESH_TOKEN = os.getenv("BLOGGER_REFRESH_TOKEN")
 BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID")
+BING_WEBMASTER_CLIENT_ID = os.getenv("BING_WEBMASTER_CLIENT_ID")
+BING_WEBMASTER_CLIENT_SECRET = os.getenv("BING_WEBMASTER_CLIENT_SECRET")
+BING_WEBMASTER_REFRESH_TOKEN = os.getenv("BING_WEBMASTER_REFRESH_TOKEN")
 
 
 for name, value in {
@@ -501,11 +505,12 @@ def get_blogger_token():
     return response.json()["access_token"]
 
 
-def build_blogger_html(video, metadata, poster, backdrop):
+def build_blogger_html(video, metadata, poster, backdrop, settings):
     artist = html.escape(metadata["artist"], quote=True)
     song = html.escape(metadata["song"], quote=True)
     year = html.escape(metadata["year"], quote=True)
     video_id = html.escape(video["video_id"], quote=True)
+    description = html.escape(build_seo_description(metadata, settings), quote=True)
 
     youtube_embed = (
         f"https://www.youtube.com/embed/{video_id}"
@@ -523,13 +528,17 @@ def build_blogger_html(video, metadata, poster, backdrop):
 <div class="data-quality">Official Music Video</div>
 <div class="data-lang">Original Audio</div>
 <div class="data-backdrop">{backdrop}</div>
-<div class="data-desc"></div>
+<div class="data-desc">{description}</div>
 <div class="data-video-id" style="display: none;">{video_id}</div>
 
 <div class="data-season" data-title="{song}">
   <div class="movie-row">
     <button class="ep-play" onclick="playUrl('{youtube_embed}')">Watch Now</button>
   </div>
+</div>
+<div class="ogflix-topic-links" style="margin:24px 0;padding:16px;border:1px solid #333;border-radius:10px;">
+  <strong>Explore more on OGFlix TV</strong>
+  <p><a href="/search/label/Artist-{seo_slug(metadata['artist'])}">More from {artist}</a> · <a href="/search/label/Song-{seo_slug(metadata['song'])}">More songs like {song}</a> · <a href="/search/label/MusicVideos">Browse Music Videos</a> · <a href="/search/label/Rap">Browse Rap</a> · <a href="/search/label/Hip-Hop">Browse Hip-Hop</a> · <a href="/search/label/R%26B">Browse R&amp;B</a></p>
 </div>
 </div>'''
 
@@ -556,6 +565,14 @@ def build_blogger_labels(video, metadata, settings):
         # music videos, so these are the default labels for its posts.
         labels.extend(["MusicVideos", "Songs"])
 
+    # Artist and song labels create crawlable topic hubs for related posts.
+    artist_slug = seo_slug(metadata.get("artist", ""))
+    song_slug = seo_slug(metadata.get("song", ""))
+    if artist_slug:
+        labels.append(f"Artist-{artist_slug}")
+    if song_slug:
+        labels.append(f"Song-{song_slug}")
+
     # Add configured music genres/categories without duplicates.
     for category in settings.get("music_categories", []):
         value = str(category).strip()
@@ -566,12 +583,71 @@ def build_blogger_labels(video, metadata, settings):
     return list(dict.fromkeys(labels))
 
 
+def seo_slug(value):
+    """Create a compact, readable Blogger label suffix."""
+    value = re.sub(r"[^a-z0-9]+", "-", str(value).lower()).strip("-")
+    return value[:65].strip("-")
+
+
+def build_seo_description(metadata, settings):
+    artist = metadata.get("artist", "").strip()
+    song = metadata.get("song", "").strip()
+    blog_name = settings.get("blog_name", "OGFlix TV")
+    return (
+        f"Watch {song} by {artist} on {blog_name}. "
+        "Discover official hip-hop and R&B music videos, new releases, "
+        "artists, and entertainment on OGFlix TV."
+    )[:300]
+
+
+def bing_submit_published_url(post_url, settings):
+    """Notify Bing after a post is published, when Bing OAuth is configured."""
+    if not all((BING_WEBMASTER_CLIENT_ID, BING_WEBMASTER_CLIENT_SECRET,
+                BING_WEBMASTER_REFRESH_TOKEN)):
+        print("BING URL SUBMISSION: skipped (Bing Webmaster OAuth secrets are not configured).")
+        return False
+
+    try:
+        token_response = requests.post(
+            "https://www.bing.com/webmasters/oauth/token",
+            data={
+                "client_id": BING_WEBMASTER_CLIENT_ID,
+                "client_secret": BING_WEBMASTER_CLIENT_SECRET,
+                "refresh_token": BING_WEBMASTER_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=30,
+        )
+        token_response.raise_for_status()
+        access_token = token_response.json().get("access_token")
+        if not access_token:
+            raise RuntimeError("Bing OAuth response did not include an access token.")
+
+        site_url = str(settings.get("blog_url", "https://ogflixtv.blogspot.com/")).strip()
+        submit_response = requests.post(
+            "https://www.bing.com/webmaster/api.svc/json/SubmitUrl",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={"siteUrl": site_url, "url": post_url},
+            timeout=30,
+        )
+        submit_response.raise_for_status()
+        print(f"BING URL SUBMITTED: {post_url}")
+        return True
+    except Exception as exc:
+        # Search submission must never undo a successful Blogger publication.
+        print(f"BING URL SUBMISSION WARNING: {exc}")
+        return False
+
+
 def publish_to_blogger(video, metadata, poster, backdrop, token, settings):
     blog_id = BLOGGER_BLOG_ID
 
     title = f"{metadata['song']} - {metadata['artist']}"
     content = build_blogger_html(
-        video, metadata, poster, backdrop
+        video, metadata, poster, backdrop, settings
     )
 
     post_mode = settings.get("post_mode", "draft").lower()
@@ -654,7 +730,7 @@ def main():
                 video["video_id"]
             )
 
-            publish_to_blogger(
+            blogger_result = publish_to_blogger(
                 video,
                 metadata,
                 poster,
@@ -662,6 +738,10 @@ def main():
                 token,
                 settings
             )
+
+            published_url = blogger_result.get("url")
+            if published_url and settings.get("post_mode", "draft").lower() == "publish":
+                bing_submit_published_url(published_url, settings)
 
             posted.add(video["video_id"])
             save_posted(posted)
