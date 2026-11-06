@@ -6,7 +6,7 @@
     "Hip-Hop",
     "R&B"
   ],
-  "post_mode": "publish",
+  "post_mode": "draft",
   "cover_format": "2:3",
   "videos_per_run": 10,
   "lookback_hours": 168
